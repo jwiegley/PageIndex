@@ -1,4 +1,5 @@
 import litellm
+import openai
 import logging
 import os
 import textwrap
@@ -17,11 +18,118 @@ import yaml
 from pathlib import Path
 from types import SimpleNamespace as config
 
+
+def _configure_ssl():
+    """
+    Configure SSL_CERT_FILE to use a CA bundle that includes private CAs.
+    Only runs if OPENAI_BASE_URL is set (custom endpoint likely needs custom CAs).
+    """
+    base_url = os.getenv("OPENAI_BASE_URL")
+    if not base_url:
+        # Using standard OpenAI endpoint, no need to fiddle with certs
+        return
+
+    def count_certs(cert_file):
+        """Count number of certificates in a PEM bundle."""
+        try:
+            with open(cert_file, 'r') as f:
+                return f.read().count('-----BEGIN CERTIFICATE-----')
+        except (OSError, IOError):
+            return 0
+
+    # Get current SSL_CERT_FILE and its cert count
+    current_cert_file = os.getenv("SSL_CERT_FILE")
+    current_cert_count = count_certs(current_cert_file) if current_cert_file else 0
+
+    # Candidate bundles in priority order
+    candidates = [
+        Path.home() / ".config" / "curl" / "ca-bundle.crt",
+        Path.home() / ".local" / "share" / "ca-certificates" / "ca-bundle.crt",
+    ]
+
+    best_bundle = current_cert_file
+    best_count = current_cert_count
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+
+        cert_count = count_certs(str(candidate))
+        if cert_count > best_count:
+            best_bundle = str(candidate)
+            best_count = cert_count
+
+    # Set SSL_CERT_FILE if we found a better bundle
+    if best_bundle and best_bundle != current_cert_file:
+        os.environ["SSL_CERT_FILE"] = best_bundle
+
+
+# Configure SSL before any LLM clients are created
+_configure_ssl()
+
 # Backward compatibility: support CHATGPT_API_KEY as alias for OPENAI_API_KEY
 if not os.getenv("OPENAI_API_KEY") and os.getenv("CHATGPT_API_KEY"):
     os.environ["OPENAI_API_KEY"] = os.getenv("CHATGPT_API_KEY")
 
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL")
+
 litellm.drop_params = True
+
+# Cache for resolved model name so we only query /v1/models once
+_resolved_model_cache = {}
+
+
+def _resolve_model(model):
+    """
+    Resolve a model name against the API endpoint. When OPENAI_BASE_URL is set,
+    the requested model name may not exist on the proxy. This queries the
+    /v1/models endpoint and picks the closest available alternative.
+    """
+    if not OPENAI_BASE_URL or not model:
+        return model
+    if model in _resolved_model_cache:
+        return _resolved_model_cache[model]
+
+    try:
+        client = openai.OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=OPENAI_BASE_URL,
+        )
+        available = [m.id for m in client.models.list().data]
+    except Exception:
+        _resolved_model_cache[model] = model
+        return model
+
+    if model in available:
+        _resolved_model_cache[model] = model
+        return model
+
+    # Model not found — pick the best alternative.
+    # Preference order for chat-capable models:
+    preferences = [
+        "openai/gpt-4.1",
+        "openai/gpt-4o",
+        "openai/gpt-4.1-mini",
+        "openai/o3-pro",
+    ]
+    for pref in preferences:
+        if pref in available:
+            print(f"Model '{model}' not available, using '{pref}' instead")
+            _resolved_model_cache[model] = pref
+            return pref
+
+    # Last resort: pick any model with 'gpt' in the name
+    gpt_models = [m for m in available if 'gpt' in m.lower()]
+    if gpt_models:
+        chosen = gpt_models[0]
+        print(f"Model '{model}' not available, using '{chosen}' instead")
+        _resolved_model_cache[model] = chosen
+        return chosen
+
+    # Nothing suitable found, return original and let it fail with a clear error
+    _resolved_model_cache[model] = model
+    return model
+
 
 def count_tokens(text, model=None):
     if not text:
@@ -32,6 +140,7 @@ def count_tokens(text, model=None):
 def llm_completion(model, prompt, chat_history=None, return_finish_reason=False):
     if model:
         model = model.removeprefix("litellm/")
+    model = _resolve_model(model)
     max_retries = 10
     messages = list(chat_history) + [{"role": "user", "content": prompt}] if chat_history else [{"role": "user", "content": prompt}]
     for i in range(max_retries):
@@ -46,6 +155,8 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
                 finish_reason = "max_output_reached" if response.choices[0].finish_reason == "length" else "finished"
                 return content, finish_reason
             return content
+        except litellm.BadRequestError as e:
+            raise RuntimeError(f"API rejected request for model '{model}': {e}") from e
         except Exception as e:
             print('************* Retrying *************')
             logging.error(f"Error: {e}")
@@ -62,6 +173,7 @@ def llm_completion(model, prompt, chat_history=None, return_finish_reason=False)
 async def llm_acompletion(model, prompt):
     if model:
         model = model.removeprefix("litellm/")
+    model = _resolve_model(model)
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
     for i in range(max_retries):
@@ -72,6 +184,8 @@ async def llm_acompletion(model, prompt):
                 temperature=0,
             )
             return response.choices[0].message.content
+        except litellm.BadRequestError as e:
+            raise RuntimeError(f"API rejected request for model '{model}': {e}") from e
         except Exception as e:
             print('************* Retrying *************')
             logging.error(f"Error: {e}")

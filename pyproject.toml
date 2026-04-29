@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pageindex"
+version = "0.1.0"
+description = "A vectorless, reasoning-based RAG system"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.0",
+    "pymupdf>=1.20",
+    "PyPDF2>=3.0",
+    "python-dotenv>=1.0",
+    "tiktoken>=0.11",
+    "pyyaml>=6.0",
+]
+
+[tool.setuptools]
+packages = ["pageindex"]
+
+[tool.setuptools.package-data]
+pageindex = ["config.yaml"]
